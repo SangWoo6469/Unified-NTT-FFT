@@ -1,0 +1,5 @@
+/home/sangwoo/unified NTT_FFT/build/CMakeFiles/core_objs.dir
+/home/sangwoo/unified NTT_FFT/build/CMakeFiles/run_fft.dir
+/home/sangwoo/unified NTT_FFT/build/CMakeFiles/run_ntt.dir
+/home/sangwoo/unified NTT_FFT/build/CMakeFiles/edit_cache.dir
+/home/sangwoo/unified NTT_FFT/build/CMakeFiles/rebuild_cache.dir
