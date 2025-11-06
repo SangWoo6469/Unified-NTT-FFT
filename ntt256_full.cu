@@ -1,4 +1,10 @@
-// ntt256_bench_all.cu
+// ntt256_full.cu  (Barrett reduction, CSV 출력 포함)
+// - N=256, radix {2,4,8,16}
+// - 입력/출력: 일반 도메인
+// - 곱셈: Barrett, 덧셈/뺄셈: raw (+, -) (감축 없음)
+// - pretwiddle는 stage별 drop-1 flat 테이블(사전계산) 사용
+// - 실행 결과를 CSV로 저장 (argv[3]에 경로 주면 파일로 기록)
+
 #include <cstdio>
 #include <cstdint>
 #include <vector>
@@ -6,6 +12,7 @@
 #include <random>
 #include <algorithm>
 #include <cassert>
+#include <fstream>
 #include <cuda_runtime.h>
 
 // ================= Global params =================
@@ -23,15 +30,9 @@ __constant__ uint32_t d_Q;     // modulus
 __constant__ uint64_t d_mu;    // floor(2^64 / Q)
 
 // ================= Device helpers =================
-// ----- Lazy add/sub (no conditional reduction) -----
-__device__ __forceinline__ uint32_t add_lazy(uint32_t a, uint32_t b){
-    // 그냥 더함 (감축 없음)
-    return a + b;
-}
-__device__ __forceinline__ uint32_t sub_lazy(uint32_t a, uint32_t b){
-    // 언더플로우 방지만 수행 (감축 없음)
-    return a -b;
-}
+// ----- Raw add/sub (요청대로 감축 없음) -----
+__device__ __forceinline__ uint32_t add_raw(uint32_t a, uint32_t b){ return a + b; }
+__device__ __forceinline__ uint32_t sub_raw(uint32_t a, uint32_t b){ return a - b; }
 
 // ----- Barrett mul: r = a*b mod Q (k = 64) -----
 // d_mu = floor(2^64 / Q)
@@ -109,19 +110,18 @@ void r2_step(const StageDesc& stg, int bfu){
     int ia = base + j1 + 0 * j;
     int ib = base + j1 + 1 * j;
     uint32_t a = svec[ia], b = svec[ib];
-    svec[ia] = add_lazy(a,b);
-    svec[ib] = sub_lazy(a,b);
+    svec[ia] = add_raw(a,b);
+    svec[ib] = sub_raw(a,b);
 }
 
-// ================= Radix-4 (네 정의) =================
-// BFU당 스레드 = 2, lane ∈ {0,1}
+// ================= Radix-4 =================
 __device__ __forceinline__
 void r4_step1_pairs(const StageDesc& stg, int bfu, int lane){
     int a = (lane == 0) ? 0 : 2;
     int b = a + 1;
     int ia = addr_loc(stg,bfu,a), ib = addr_loc(stg,bfu,b);
     uint32_t xa = svec[ia], xb = svec[ib];
-    svec[ia] = add_lazy(xa,xb); svec[ib] = sub_lazy(xa,xb);
+    svec[ia] = add_raw(xa,xb); svec[ib] = sub_raw(xa,xb);
 }
 __device__ __forceinline__
 void r4_step2_twiddle(const StageDesc& stg, int bfu, int lane){
@@ -136,29 +136,28 @@ void r4_step3_pairs(const StageDesc& stg, int bfu, int lane){
     int b = a + 2;
     int ia = addr_loc(stg,bfu,a), ib = addr_loc(stg,bfu,b);
     uint32_t xa = svec[ia], xb = svec[ib];
-    svec[ia] = add_lazy(xa,xb); svec[ib] = sub_lazy(xa,xb);
+    svec[ia] = add_raw(xa,xb); svec[ib] = sub_raw(xa,xb);
 }
 
-// ================= Radix-8 (네 정의) =================
-// BFU당 스레드 = 4, lane ∈ {0,1,2,3}
+// ================= Radix-8 =================
 __device__ __forceinline__
 void r8_step1_pairs(const StageDesc& stg, int bfu, int lane){
     const int P[4][2] = { {0,1},{2,3},{4,5},{6,7} };
     int a = P[lane][0], b = P[lane][1];
     int ia = addr_loc(stg,bfu,a), ib = addr_loc(stg,bfu,b);
     uint32_t xa = svec[ia], xb = svec[ib];
-    svec[ia] = add_lazy(xa,xb); svec[ib] = sub_lazy(xa,xb);
+    svec[ia] = add_raw(xa,xb); svec[ib] = sub_raw(xa,xb);
 }
 __device__ __forceinline__
 void r8_step2_mid(const StageDesc& stg, int bfu, int lane){
     if (lane == 2){
         int ia=addr_loc(stg,bfu,4), ib=addr_loc(stg,bfu,6);
         uint32_t xa=svec[ia], xb=svec[ib];
-        svec[ia]=add_lazy(xa,xb); svec[ib]=sub_lazy(xa,xb);
+        svec[ia]=add_raw(xa,xb); svec[ib]=sub_raw(xa,xb);
     } else if (lane == 3){
         int ia=addr_loc(stg,bfu,5), ib=addr_loc(stg,bfu,7);
         uint32_t xa=svec[ia], xb=svec[ib];
-        svec[ia]=add_lazy(xa,xb); svec[ib]=sub_lazy(xa,xb);
+        svec[ia]=add_raw(xa,xb); svec[ib]=sub_raw(xa,xb);
     }
 }
 __device__ __forceinline__
@@ -173,15 +172,15 @@ void r8_step4_pairs(const StageDesc& stg, int bfu, int lane){
     if (lane == 0){
         int ia=addr_loc(stg,bfu,0), ib=addr_loc(stg,bfu,2);
         uint32_t xa=svec[ia], xb=svec[ib];
-        svec[ia]=add_lazy(xa,xb); svec[ib]=sub_lazy(xa,xb);
+        svec[ia]=add_raw(xa,xb); svec[ib]=sub_raw(xa,xb);
     } else if (lane == 1){
         int ia=addr_loc(stg,bfu,1), ib=addr_loc(stg,bfu,3);
         uint32_t xa=svec[ia], xb=svec[ib];
-        svec[ia]=add_lazy(xa,xb); svec[ib]=sub_lazy(xa,xb);
+        svec[ia]=add_raw(xa,xb); svec[ib]=sub_raw(xa,xb);
     } else if (lane == 2){
         int ia=addr_loc(stg,bfu,5), ib=addr_loc(stg,bfu,7);
         uint32_t xa=svec[ia], xb=svec[ib];
-        svec[ia]=add_lazy(xa,xb); svec[ib]=sub_lazy(xa,xb);
+        svec[ia]=add_raw(xa,xb); svec[ib]=sub_raw(xa,xb);
     }
 }
 __device__ __forceinline__
@@ -190,17 +189,16 @@ void r8_step5_final(const StageDesc& stg, int bfu, int lane){
     int a = P[lane][0], b = P[lane][1];
     int ia = addr_loc(stg,bfu,a), ib = addr_loc(stg,bfu,b);
     uint32_t xa = svec[ia], xb = svec[ib];
-    svec[ia] = add_lazy(xa,xb); svec[ib] = sub_lazy(xa,xb);
+    svec[ia] = add_raw(xa,xb); svec[ib] = sub_raw(xa,xb);
 }
 
-// ================= Radix-16 (네 정의 + Output 페어 수정) =================
-// BFU당 스레드 = 8, lane ∈ {0..7}
+// ================= Radix-16 =================
 __device__ __forceinline__
 void r16_p1(const StageDesc& stg, int bfu, int lane){
     int a = 2*lane, b = a+1;
     int ia = addr_loc(stg,bfu,a), ib = addr_loc(stg,bfu,b);
     uint32_t xa=svec[ia], xb=svec[ib];
-    svec[ia]=add_lazy(xa,xb); svec[ib]=sub_lazy(xa,xb);
+    svec[ia]=add_raw(xa,xb); svec[ib]=sub_raw(xa,xb);
 }
 __device__ __forceinline__
 void r16_p2(const StageDesc& stg, int bfu, int lane){
@@ -209,7 +207,7 @@ void r16_p2(const StageDesc& stg, int bfu, int lane){
         int a=P[lane][0], b=P[lane][1];
         int ia=addr_loc(stg,bfu,a), ib=addr_loc(stg,bfu,b);
         uint32_t xa=svec[ia], xb=svec[ib];
-        svec[ia]=add_lazy(xa,xb); svec[ib]=sub_lazy(xa,xb);
+        svec[ia]=add_raw(xa,xb); svec[ib]=sub_raw(xa,xb);
     }
 }
 __device__ __forceinline__
@@ -219,15 +217,15 @@ void r16_p3(const StageDesc& stg, int bfu, int lane){
         uint32_t v11= svec[addr_loc(stg,bfu,11)];
         uint32_t v13= svec[addr_loc(stg,bfu,13)];
         uint32_t v15= svec[addr_loc(stg,bfu,15)];
-        s0_accum[bfu]=add_lazy(v9,v11);
-        s1_accum[bfu]=add_lazy(v13,v15);
+        s0_accum[bfu]=add_raw(v9,v11);
+        s1_accum[bfu]=add_raw(v13,v15);
     }
     const int P[3][2]={{10,14},{8,12},{0,4}};
     if (lane<3){
         int a=P[lane][0], b=P[lane][1];
         int ia=addr_loc(stg,bfu,a), ib=addr_loc(stg,bfu,b);
         uint32_t xa=svec[ia], xb=svec[ib];
-        svec[ia]=add_lazy(xa,xb); svec[ib]=sub_lazy(xa,xb);
+        svec[ia]=add_raw(xa,xb); svec[ib]=sub_raw(xa,xb);
     }
 }
 __device__ __forceinline__
@@ -249,8 +247,8 @@ __device__ __forceinline__
 void r16_p5(const StageDesc& stg, int bfu, int lane){
     if (lane==0){
         uint32_t s0=s0_accum[bfu], s1=s1_accum[bfu];
-        s0_accum[bfu]=add_lazy(s0,s1);
-        s1_accum[bfu]=sub_lazy(s0,s1);
+        s0_accum[bfu]=add_raw(s0,s1);
+        s1_accum[bfu]=sub_raw(s0,s1);
         int i5=addr_loc(stg,bfu,5);  svec[i5]=mul_barrett(svec[i5], d_m16[10]);
         int i7=addr_loc(stg,bfu,7);  svec[i7]=mul_barrett(svec[i7], d_m16[11]);
         int i6=addr_loc(stg,bfu,6);  svec[i6]=mul_barrett(svec[i6], d_m16[12]);
@@ -260,7 +258,7 @@ void r16_p5(const StageDesc& stg, int bfu, int lane){
         int a=P[lane][0], b=P[lane][1];
         int ia=addr_loc(stg,bfu,a), ib=addr_loc(stg,bfu,b);
         uint32_t xa=svec[ia], xb=svec[ib];
-        svec[ia]=add_lazy(xa,xb); svec[ib]=sub_lazy(xa,xb);
+        svec[ia]=add_raw(xa,xb); svec[ib]=sub_raw(xa,xb);
     }
 }
 __device__ __forceinline__
@@ -270,11 +268,11 @@ void r16_p6(const StageDesc& stg, int bfu, int lane){
         int a=P[lane][0], b=P[lane][1];
         int ia=addr_loc(stg,bfu,a), ib=addr_loc(stg,bfu,b);
         uint32_t xa=svec[ia], xb=svec[ib];
-        svec[ia]=add_lazy(xa,xb); svec[ib]=sub_lazy(xa,xb);
+        svec[ia]=add_raw(xa,xb); svec[ib]=sub_raw(xa,xb);
     }
     if (lane==0){
-        int i9 =addr_loc(stg,bfu,9 ); svec[i9 ]=sub_lazy(s0_accum[bfu], svec[i9 ]);
-        int i15=addr_loc(stg,bfu,15); svec[i15]=sub_lazy(s1_accum[bfu], svec[i15]);
+        int i9 =addr_loc(stg,bfu,9 ); svec[i9 ]=sub_raw(s0_accum[bfu], svec[i9 ]);
+        int i15=addr_loc(stg,bfu,15); svec[i15]=sub_raw(s1_accum[bfu], svec[i15]);
     }
 }
 __device__ __forceinline__
@@ -283,7 +281,7 @@ void r16_p7(const StageDesc& stg, int bfu, int lane){
     int a=P[lane][0], b=P[lane][1];
     int ia=addr_loc(stg,bfu,a), ib=addr_loc(stg,bfu,b);
     uint32_t xa=svec[ia], xb=svec[ib];
-    svec[ia]=add_lazy(xa,xb); svec[ib]=sub_lazy(xa,xb);
+    svec[ia]=add_raw(xa,xb); svec[ib]=sub_raw(xa,xb);
     if (lane==7){
         int i11=addr_loc(stg,bfu,11), i13=addr_loc(stg,bfu,13);
         uint32_t t=svec[i11]; svec[i11]=svec[i13]; svec[i13]=t;
@@ -470,8 +468,11 @@ static void free_stagepack(StagePack& P){
 int main(int argc, char** argv){
     int runs = 50;
     unsigned seed = 0x1234;
+    const char* csv_path = nullptr;
+
     if (argc >= 2) runs = std::max(1, atoi(argv[1]));
     if (argc >= 3) seed = (unsigned)strtoul(argv[2], nullptr, 0);
+    if (argc >= 4) csv_path = argv[3];
 
     // 0) Barrett params upload
     {
@@ -547,15 +548,15 @@ int main(int argc, char** argv){
 
     cudaFree(dA);
 
-    // 5) 오름차순 정렬 및 출력(단위 상세)
+    // 5) 오름차순 정렬
     std::sort(results.begin(), results.end(), [](const Row& a, const Row& b){
         if (a.ms != b.ms) return a.ms < b.ms;
         return a.name < b.name;
     });
 
+    // 6) 출력(콘솔)
     printf("=== NTT N=256, all radix plans (factors in {2,4,8,16}, product=256) ===\n");
     printf("runs=%d, seed=0x%X (kernel time only; pretwiddle build excluded)\n\n", runs, seed);
-
     printf("%-20s  %12s  %12s  %12s  %14s  %12s\n",
            "plan", "avg [ms]", "avg [µs]", "avg [ns]", "ns/coeff (N=256)", "Gcoeff/s");
     for (auto& r : results){
@@ -569,5 +570,31 @@ int main(int argc, char** argv){
                r.name.c_str(),
                ms, us, ns, ns_per_coeff, gcoeff_per_s);
     }
+
+    // 7) CSV 저장(선택)
+    if (csv_path){
+        std::ofstream csv(csv_path);
+        if (csv){
+            csv << "plan,avg_ms,avg_us,avg_ns,ns_per_coeff,gcoeff_per_s\n";
+            for (auto& r : results){
+                double ms = r.ms;
+                double us = ms * 1e3;
+                double ns = ms * 1e6;
+                double ns_per_coeff = ns / double(N);
+                double gcoeff_per_s = (double)N / (ms * 1e-3) / 1e9;
+                csv << r.name << ","
+                    << ms << ","
+                    << us << ","
+                    << ns << ","
+                    << ns_per_coeff << ","
+                    << gcoeff_per_s << "\n";
+            }
+            csv.close();
+            printf("\n[CSV] saved: %s\n", csv_path);
+        } else {
+            fprintf(stderr, "[WARN] failed to open CSV for write: %s\n", csv_path);
+        }
+    }
+
     return 0;
 }

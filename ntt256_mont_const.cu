@@ -28,6 +28,22 @@ __constant__ uint32_t d_Q;        // modulus
 __constant__ uint32_t d_nprime;   // n' = -q^{-1} mod 2^32
 // (입력은 일반 도메인, 상수만 R-도메인이므로 d_R, d_RR는 불필요)
 
+// ===================== StageDesc & Shared buffers (먼저 선언!) ======================
+struct StageDesc {
+    int R;                // 2/4/8/16
+    int j;                // 누적 stride
+    const uint32_t* flat; // drop-1 table (Montgomery-encoded), len = j*(R-1)
+};
+
+__shared__ uint32_t svec[N];
+__shared__ uint32_t s0_accum[128]; // R=16 중간합
+__shared__ uint32_t s1_accum[128];
+
+// ================= BFU consts (Montgomery-encoded) =================
+__constant__ uint32_t d_m4_omega;  // Radix-4 내부 곱 (Montgomery)
+__constant__ uint32_t d_m8[8];     // Radix-8 내부 곱들 (Montgomery)
+__constant__ uint32_t d_m16[13];   // Radix-16 내부 곱들 (Montgomery)
+
 // ===================== Device helpers ======================
 // +, - : 감축/폴딩 없음 (요청사항)
 __device__ __forceinline__ uint32_t add_lazy(uint32_t a, uint32_t b){ return a + b; }
@@ -50,23 +66,6 @@ __device__ __forceinline__ unsigned bitrev8_dev(unsigned x){
     x = ((x & 0xAAu) >> 1) | ((x & 0x55u) << 1);
     return x;
 }
-
-// ================= Shared buffers =================
-__shared__ uint32_t svec[N];
-__shared__ uint32_t s0_accum[128]; // R=16 중간합
-__shared__ uint32_t s1_accum[128];
-
-// ================= Stage descriptor =================
-struct StageDesc {
-    int R;                // 2/4/8/16
-    int j;                // 누적 stride
-    const uint32_t* flat; // drop-1 table (Montgomery-encoded), len = j*(R-1)
-};
-
-// ================= BFU consts (Montgomery-encoded) =================
-__constant__ uint32_t d_m4_omega;  // Radix-4 내부 곱 (Montgomery)
-__constant__ uint32_t d_m8[8];     // Radix-8 내부 곱들 (Montgomery)
-__constant__ uint32_t d_m16[13];   // Radix-16 내부 곱들 (Montgomery)
 
 // ================= Addr helper =================
 __device__ __forceinline__ int addr_loc(const StageDesc& stg, int bfu, int i){
@@ -100,7 +99,31 @@ void drop1_pretwiddle_parallel(const StageDesc& stg, int bfu, int lane){
     }
 }
 
-// ================= Radix-2 =================
+// ================= Radix-2: fused (pre-twiddle + Hadamard) =================
+__device__ __forceinline__
+void r2_fused_mont(const StageDesc& stg, int bfu){
+    // 한 스레드가 해당 BFU 처리 (lane==0에서만 호출)
+    int j   = stg.j;
+    int k   = bfu / j;
+    int j1  = bfu % j;
+    int base= (2 * k) * j;
+
+    int ia = base + j1 + 0 * j;
+    int ib = base + j1 + 1 * j;
+
+    uint32_t a0 = svec[ia];
+    uint32_t a1 = svec[ib];
+
+    // twiddle는 몽고메리 인코드 상태 (wR)
+    // drop-1 규칙에 의해 radix-2에서는 상단에 twiddle 없음, 하단에만 w^(2*j1+1)
+    uint32_t wR = stg.flat[j1];   // len=j * (R-1) with R=2 -> j entries
+    a1 = mont_mul(a1, wR);        // a1 * w
+
+    svec[ia] = add_lazy(a0, a1);
+    svec[ib] = sub_lazy(a0, a1);
+}
+
+// (참고: 기본 r2_step 템플릿은 쓰지 않지만 남겨둠)
 template<int R>
 __device__ __forceinline__
 void r2_step(const StageDesc& stg, int bfu){
@@ -302,14 +325,18 @@ __device__ void run_stage_like_python(const StageDesc& stg){
     int BFUs= N / R;
     if (bfu >= BFUs) return;
 
+    if (R == 2){
+        if (lane == 0) r2_fused_mont(stg, bfu);
+        __syncthreads();
+        return;
+    }
+
     // 1) pre-twiddle (Montgomery)
     drop1_pretwiddle_parallel(stg, bfu, lane);
     __syncthreads();
 
     // 2) BFU 내부 스텝들(스텝마다 배리어)
-    if (R == 2){
-        if (lane==0) r2_step<2>(stg,bfu); __syncthreads();
-    } else if (R == 4){
+    if (R == 4){
         r4_step1_pairs(stg,bfu,lane);   __syncthreads();
         r4_step2_twiddle(stg,bfu,lane); __syncthreads();
         r4_step3_pairs(stg,bfu,lane);   __syncthreads();
@@ -498,12 +525,39 @@ static void free_stagepack(StagePack& P){
     P = StagePack{};
 }
 
+// ================= CSV writer =================
+static void write_csv(const char* path,
+    const std::vector<std::pair<std::string, double>>& rows,
+    int runs, unsigned seed,
+    const char* variant) {
+    FILE* fp = fopen(path, "w");
+    if (!fp) {
+        fprintf(stderr, "[WARN] cannot open CSV for write: %s\n", path);
+        return;
+    }
+    fprintf(fp, "plan,avg_ms,avg_us,avg_ns,ns_per_coeff,Gcoeff_per_s,runs,seed,variant\n");
+    for (auto& kv : rows) {
+        const std::string& name = kv.first;
+        double ms = kv.second;
+        double us = ms * 1e3;
+        double ns = ms * 1e6;
+        double ns_per_coeff = ns / double(N);
+        double gcoeff_per_s = (double)N / (ms * 1e-3) / 1e9;
+        fprintf(fp, "%s,%.6f,%.3f,%.0f,%.2f,%.3f,%d,0x%X,%s\n",
+                name.c_str(), ms, us, ns, ns_per_coeff, gcoeff_per_s,
+                runs, seed, variant);
+    }
+    fclose(fp);
+}
+
 // ================= Main =================
 int main(int argc, char** argv){
     int runs = 50;
     unsigned seed = 0x1234;
+    const char* csv_path = "ntt256_mont_const.csv"; // 기본값
     if (argc >= 2) runs = std::max(1, atoi(argv[1]));
     if (argc >= 3) seed = (unsigned)strtoul(argv[2], nullptr, 0);
+    if (argc >= 4) csv_path = argv[3];
 
     // 0) Montgomery params upload: n' and q
     {
@@ -600,5 +654,12 @@ int main(int argc, char** argv){
                r.name.c_str(),
                ms, us, ns, ns_per_coeff, gcoeff_per_s);
     }
+
+    // 6) CSV 저장
+    std::vector<std::pair<std::string, double>> rows;
+    rows.reserve(results.size());
+    for (auto& r : results) rows.emplace_back(r.name, r.ms);
+    write_csv(csv_path, rows, runs, seed, "montgomery");
+
     return 0;
 }
